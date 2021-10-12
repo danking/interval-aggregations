@@ -55,6 +55,7 @@ import hailtop.batch as hb
 import functools
 import asyncio
 import json
+import argparse
 
 from hailtop.utils import grouped, secret_alnum_string, bounded_gather
 from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
@@ -99,15 +100,16 @@ async def main(rerun: bool = False, prefix_rows: Optional[int] = None, group_siz
             "gs://gcp-public-data--broad-references/hg38/v0/exome_calling_regions.v1.interval_list", reference_genome='GRCh38')
         if prefix_rows is not None:
             intervals = intervals.head(prefix_rows)
-        intervals = intervals.annotate_globals(
-            uuid=uuid,
-            prefix_rows=prefix_rows
-        )
-        intervals = intervals.add_index('idx')
         if group_size is None:
             group_size = 20
+        intervals = intervals.annotate_globals(
+            uuid=uuid,
+            prefix_rows=prefix_rows,
+            group_size=group_size
+        )
+        intervals = intervals.add_index('idx')
         intervals = intervals.group_by(
-            group_index = intervals.idx // group_size
+            group_index = intervals.idx // group_size,
         ).aggregate(
             intervals = hl.agg.collect(intervals.interval)
         )
@@ -209,5 +211,12 @@ async def main(rerun: bool = False, prefix_rows: Optional[int] = None, group_siz
             return
 
 
+parser = argparse.ArgumentParser()
 
-asyncio.get_event_loop().run_until_complete(main(rerun=True, prefix_rows=30_000, group_size=20))
+parser.add_argument("--rerun", action="store_true")
+parser.add_argument('--prefix-rows', type=int, help='number of intervals to aggregate (FOR TESTING ONLY)')
+parser.add_argument('--group-size', type=int, help='number of intervals to aggregate in one Hail Batch job')
+
+args = parser.parse_args()
+
+asyncio.get_event_loop().run_until_complete(main(rerun=args.rerun, prefix_rows=args.prefix_rows, group_size=args.group_size))
