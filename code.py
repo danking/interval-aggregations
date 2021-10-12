@@ -1,7 +1,15 @@
 from typing import List, Tuple, Optional
+import hail as hl
+import hailtop.batch as hb
+import functools
+import asyncio
+import json
+import argparse
 
-###############################################################################
-## Serialized functions (must appear before library imports)
+from hailtop.utils import grouped, secret_alnum_string, bounded_gather
+from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
+from hailtop.aiotools.fs import AsyncFS
+
 
 def aggregate_by_intervals(index, intervals, uuid) -> List[str]:
     import hail as hl
@@ -22,6 +30,7 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
     import hail as hl
     import sys
     from hailtop.utils import secret_alnum_string
+
     attempt_id = secret_alnum_string(5)
     path = f'gs://ccdg-30day-temp/dking/{uuid}/output_{index}_{attempt_id}.tsv'
     print(f'writing to {path}')
@@ -40,26 +49,13 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
     )
     return path
 
+
 def create_final_mt(combined_tsv: str, final_mt_path: str, partitions: int):
     import hail as hl
     mt = hl.import_matrix_table(combined_tsv, row_fields={'interval': hl.tstr})
     mt = mt.repartition(partitions)
     mt = mt.key_rows_by(interval=hl.parse_locus_interval(mt.interval, reference_genome='GRCh38'))
     mt.write(final_mt_path)
-
-##
-###############################################################################
-
-import hail as hl
-import hailtop.batch as hb
-import functools
-import asyncio
-import json
-import argparse
-
-from hailtop.utils import grouped, secret_alnum_string, bounded_gather
-from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
-from hailtop.aiotools.fs import AsyncFS
 
 
 async def construct_aggregation_job(group, cpus, uuid: str, b: hb.Batch, fs: AsyncFS) -> str:
@@ -76,6 +72,7 @@ async def construct_aggregation_job(group, cpus, uuid: str, b: hb.Batch, fs: Asy
 
     return result_path
 
+
 async def construct_aggregation_batch(grouped_intervals, cpus, uuid: str) -> Tuple[hb.Batch, List[str]]:
     b = hb.Batch(
         default_python_image='hailgenetics/hail:0.2.77',
@@ -90,7 +87,8 @@ async def construct_aggregation_batch(grouped_intervals, cpus, uuid: str) -> Tup
 
     return b, result_paths
 
-async def main(rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None):
+
+async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None):
     if hl.hadoop_exists('grouped-intervals.t') and not rerun:
         print(' >> skipping grouped intervals creation')
     else:
@@ -211,12 +209,16 @@ async def main(rerun: bool = False, prefix_rows: Optional[int] = None, group_siz
             return
 
 
-parser = argparse.ArgumentParser()
+def main():
+    parser = argparse.ArgumentParser()
 
-parser.add_argument("--rerun", action="store_true")
-parser.add_argument('--prefix-rows', type=int, help='number of intervals to aggregate (FOR TESTING ONLY)')
-parser.add_argument('--group-size', type=int, help='number of intervals to aggregate in one Hail Batch job')
+    parser.add_argument("--rerun", action="store_true")
+    parser.add_argument('--prefix-rows', type=int, help='number of intervals to aggregate (FOR TESTING ONLY)')
+    parser.add_argument('--group-size', type=int, help='number of intervals to aggregate in one Hail Batch job')
 
-args = parser.parse_args()
+    args = parser.parse_args()
 
-asyncio.get_event_loop().run_until_complete(main(rerun=args.rerun, prefix_rows=args.prefix_rows, group_size=args.group_size))
+    asyncio.get_event_loop().run_until_complete(async_main(rerun=args.rerun, prefix_rows=args.prefix_rows, group_size=args.group_size))
+
+
+main()
