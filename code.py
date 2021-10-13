@@ -248,14 +248,30 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
         )
 
         def combine_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
+            j.command('set -ex -o pipefail')
             j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
-            bodies = [f'<(gsutil cat {x} | tail -n +2 -q)' for x in xs]
-            j.command(f'cat <(gsutil cat {xs[0]} | head -n 1) {" ".join(bodies)} | bgzip | gsutil cp - {ofile}')
+            bodies = [f'<(gsutil cat {x} | tail -n +2 -q || touch fail)' for x in xs]
+            j.command(f'''
+join-files() {{
+    cat <(gsutil cat {xs[0]} | head -n 1 || touch fail) {" ".join(bodies)} | bgzip | gsutil cp - {ofile}
+    [ ! -e fail ]
+}}
+
+join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
+''')
 
         def combine_compressed_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
+            j.command('set -ex -o pipefail')
             j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
-            ungzipped_bodies = [f'<(gsutil cat {x} | zcat | tail -n +2 -q)' for x in xs]
-            j.command(f'cat <(gsutil cat {xs[0]} | zcat | head -n 1) {" ".join(ungzipped_bodies)} | bgzip | gsutil cp - {ofile}')
+            ungzipped_bodies = [f'<(gsutil cat {x} | zcat | tail -n +2 -q || touch fail)' for x in xs]
+            j.command(f'''
+join-files() {{
+    cat <(gsutil cat {xs[0]} | zcat | head -n 1 || touch fail) {" ".join(ungzipped_bodies)} | bgzip | gsutil cp - {ofile}
+    [ ! -e fail ]
+}}
+
+join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
+''')
 
         if branching_factor is None:
             branching_factor = 25
