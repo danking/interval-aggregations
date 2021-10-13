@@ -5,16 +5,20 @@ import functools
 import asyncio
 import json
 import argparse
+import math
 
 from hailtop.utils import grouped, secret_alnum_string, bounded_gather
 from hailtop.aiocloud.aiogoogle import GoogleStorageAsyncFS
 from hailtop.aiotools.fs import AsyncFS
+from hailtop.utils import tqdm
+from hailtop.utils.utils import digits_needed
 
 
-def aggregate_by_intervals(index, intervals, uuid) -> List[str]:
+def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
     import hail as hl
 
-    hl.init(master='local[1]')
+    print(f'hl.init(master="local[{cpus}]")')
+    hl.init(master=f'local[{cpus}]')
 
     exomes_vds = hl.vds.read_vds('gs://ccdg/vds/split_200k_ccdg_exome.vds')
     exomes_ref_mt = exomes_vds.reference_data
@@ -33,7 +37,7 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
 
     attempt_id = secret_alnum_string(5)
     path = f'gs://ccdg-30day-temp/dking/{uuid}/output_{index}_{attempt_id}.tsv'
-    print(f'writing to {path}')
+    print(f'writing {the_interval} to {path}')
     sys.stdout.flush()
     sys.stderr.flush()
     the_interval = hl.literal(the_interval)
@@ -50,15 +54,19 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
     return path
 
 
-def create_final_mt(combined_tsv: str, final_mt_path: str, partitions: int):
+def create_final_mt(combined_tsv: str, final_mt_path: str, cpus: int):
     import hail as hl
+    print(f'hl.init(master="local[{cpus}]")')
+    hl.init(master=f'local[{cpus}]')
     mt = hl.import_matrix_table(combined_tsv, row_fields={'interval': hl.tstr})
-    mt = mt.repartition(partitions)
-    mt = mt.key_rows_by(interval=hl.parse_locus_interval(mt.interval, reference_genome='GRCh38'))
+    mt = mt.annotate_rows(parsed_interval=hl.parse_locus_interval(mt.interval, reference_genome='GRCh38'))
+    mt = mt.key_rows_by('parsed_interval')
+    mt = mt.drop('interval')
+    mt = mt.rename({'parsed_interval': 'interval'})
     mt.write(final_mt_path)
 
 
-async def construct_aggregation_job(group, cpus, uuid: str, b: hb.Batch, fs: AsyncFS) -> str:
+async def construct_aggregation_job(group, cpus, memory, uuid: str, b: hb.Batch, fs: AsyncFS, file_pbar) -> str:
     index = group.group_index
     intervals = group.intervals
     result_path = f'gs://ccdg-30day-temp/dking/{uuid}/successful_paths_{index}.json'
@@ -66,29 +74,71 @@ async def construct_aggregation_job(group, cpus, uuid: str, b: hb.Batch, fs: Asy
     if not await fs.exists(result_path):
         j = b.new_python_job()
         j.cpu(cpus)
-        j.env("PYSPARK_SUBMIT_ARGS", "--driver-memory 3g --executor-memory 3g pyspark-shell")
-        result = j.call(aggregate_by_intervals, index, intervals, uuid)
+        j.memory(memory)
+        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {cpus * 3}g --executor-memory {cpus * 3}g pyspark-shell')
+        result = j.call(aggregate_by_intervals, index, cpus, intervals, uuid)
         b.write_output(result.as_json(), result_path)
+
+    file_pbar.update(1)
 
     return result_path
 
 
-async def construct_aggregation_batch(grouped_intervals, cpus, uuid: str) -> Tuple[hb.Batch, List[str]]:
+async def construct_aggregation_batch(service_backend, grouped_intervals, cpus, memory, uuid: str, file_pbar) -> Tuple[hb.Batch, List[str]]:
     b = hb.Batch(
         default_python_image='hailgenetics/hail:0.2.77',
-        backend=hb.ServiceBackend(billing_project='hail'),
+        backend=service_backend,
         name=f'{uuid}: interval statistics'
     )
 
     async with GoogleStorageAsyncFS() as fs:
-        result_paths = await asyncio.gather(*[
-            construct_aggregation_job(group, cpus, uuid, b, fs)
-            for group in grouped_intervals])
+        result_paths = await bounded_gather(
+            *[functools.partial(construct_aggregation_job, group, cpus, memory, uuid, b, fs, file_pbar)
+              for group in grouped_intervals],
+            parallelism=150)
 
     return b, result_paths
 
 
-async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None):
+def batch_combine2(base_combop, combop, b, name, paths, final_location: str, branching_factor=100):
+    assert isinstance(branching_factor, int) and branching_factor >= 1
+    n_levels = math.ceil(math.log(len(paths), branching_factor))
+    level_digits = digits_needed(n_levels)
+    branch_digits = digits_needed((len(paths) + branching_factor) // branching_factor)
+    tmpdir = b._backend.remote_tmpdir.rstrip('/')
+
+    def make_job_and_path(level: int, i: int, make_commands, paths: List[str], dependencies: List[hb.job.BashJob], ofile=None):
+        if ofile is None:
+            ofile = f'{tmpdir}/{level}/{i}'
+        j = b.new_job(name=f'{name}-{level:0{level_digits}}-{i:0{branch_digits}}')
+        for d in dependencies:
+            j.depends_on(d)
+        make_commands(j, paths, ofile)
+        return (j, ofile)
+
+    assert n_levels > 0
+
+    if n_levels == 1:
+        return make_job_and_path(0, 0, base_combop, paths, [], final_location)
+
+    jobs_and_paths = [
+        make_job_and_path(0, i, base_combop, paths, [])
+        for i, paths in enumerate(grouped(branching_factor, paths))]
+
+    for level in range(1, n_levels - 1):
+        jobs_and_paths = [
+            make_job_and_path(level, i, combop, [x[1] for x in jobs_and_paths], [x[0] for x in jobs_and_paths])
+            for i, jobs_and_paths in enumerate(grouped(branching_factor, jobs_and_paths))]
+
+    jobs = [x[0] for x in jobs_and_paths]
+    paths = [x[1] for x in jobs_and_paths]
+    make_job_and_path(n_levels - 1, 0, combop, paths, jobs, final_location)
+
+
+async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None, cpus: Optional[int] = None, memory: Optional[str] = None, branching_factor: Optional[int] = None):
+
+    service_backend = hb.ServiceBackend(billing_project=billing_project, remote_tmpdir='gs://ccdg-30day-temp/dking/tmp/')
+
     if hl.hadoop_exists('grouped-intervals.t') and not rerun:
         print(' >> skipping grouped intervals creation')
     else:
@@ -102,7 +152,7 @@ async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, gro
             group_size = 20
         intervals = intervals.annotate_globals(
             uuid=uuid,
-            prefix_rows=prefix_rows,
+            prefix_rows=prefix_rows if prefix_rows is not None else hl.missing(hl.tint32),
             group_size=group_size
         )
         intervals = intervals.add_index('idx')
@@ -118,14 +168,25 @@ async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, gro
     uuid = grouped_intervals_table.uuid.collect()[0]
     if prefix_rows:
         assert prefix_rows == grouped_intervals_table.prefix_rows.collect()[0]
+    else:
+        prefix_rows = grouped_intervals_table.prefix_rows.collect()[0]
     if group_size:
         assert group_size == grouped_intervals_table.group_size.collect()[0]
+    else:
+        group_size = grouped_intervals_table.group_size.collect()[0]
 
-    cpus = 2  # must be at least 2, for some large intervals 4, 8, or 16 may be necessary
+    if cpus is None:
+        cpus = 2
+    assert cpus >= 2  # must be at least 2, for some large intervals 4, 8, or 16 may be necessary
+
+    if memory is None:
+        memory = 'standard'
 
     print(f'uuid: {uuid}; cpus: {cpus}; location: gs://ccdg-30day-temp/dking/{uuid}')
 
-    b, result_paths = await construct_aggregation_batch(grouped_intervals, cpus, uuid)
+    with tqdm(desc='checking for extant aggregation files', leave=False, unit='file', total=len(grouped_intervals)) as file_pbar:
+         b, result_paths = await construct_aggregation_batch(
+             service_backend, grouped_intervals, cpus, memory, uuid, file_pbar)
     if len(b._jobs) == 0:
         print(' >> skipping aggregations')
     else:
@@ -137,7 +198,7 @@ async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, gro
             print(' >> first batch failed, halting.')
             return
 
-    combined_tsv = f'gs://ccdg-30day-temp/dking/{uuid}/total-final-result.tsv'
+    combined_tsv = f'gs://ccdg-30day-temp/dking/{uuid}/total-final-result.tsv.bgz'
 
     if hl.hadoop_exists(combined_tsv):
         print(' >> skipping TSV combination')
@@ -156,23 +217,32 @@ async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, gro
                     for path in paths]
 
         b = hb.Batch(
-            backend=hb.ServiceBackend(billing_project='hail'),
+            default_image='gcr.io/hail-vdc/dk/hail:0.2.77',
+            backend=service_backend,
             name=f'{uuid}: combine tsvs'
         )
 
-        def combine_tsvs_with_headers(b, name, xs):
-            j = b.new_job(name=name)
-            j.command(f'head -n 1 {xs[0]} > {j.ofile}')
-            j.command(f'tail -n +2 -q {" ".join(xs)} >> {j.ofile}')
-            return j.ofile
+        def combine_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
+            j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
+            bodies = [f'<(gsutil cat {x} | tail -n +2 -q)' for x in xs]
+            j.command(f'cat <(gsutil cat {xs[0]} | head -n 1) {" ".join(bodies)} | bgzip | gsutil cp - {ofile}')
 
-        combined = hb.utils._combine(
+        def combine_compressed_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
+            j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
+            ungzipped_bodies = [f'<(gsutil cat {x} | zcat | tail -n +2 -q)' for x in xs]
+            j.command(f'cat <(gsutil cat {xs[0]} | zcat | head -n 1) {" ".join(ungzipped_bodies)} | bgzip | gsutil cp - {ofile}')
+
+        if branching_factor is None:
+            branching_factor = 25
+
+        combined = batch_combine2(
             combine_tsvs_with_headers,
+            combine_compressed_tsvs_with_headers,
             b,
             'combine-tsvs-with-headers',
-            [b.read_input(path) for path in mt_paths])
-
-        b.write_output(combined, combined_tsv)
+            mt_paths,
+            final_location=combined_tsv,
+            branching_factor=branching_factor)
 
         batch_handle = b.run()
         batch_status = batch_handle.status()
@@ -188,18 +258,16 @@ async def async_main(rerun: bool = False, prefix_rows: Optional[int] = None, gro
     else:
         print(' >> running final MT creation')
 
-        if prefix_rows is not None:
-            partitions = (prefix_rows + 1500) // 1500
-
         b = hb.Batch(
             default_python_image='hailgenetics/hail:0.2.77',
-            backend=hb.ServiceBackend(billing_project='hail'),
+            backend=service_backend,
             name=f'{uuid}: final MT'
         )
         j = b.new_python_job()
-        j.cpu(8)
-        j.env("PYSPARK_SUBMIT_ARGS", "--driver-memory 24g --executor-memory 24g pyspark-shell")
-        j.call(create_final_mt, combined_tsv, final_mt_path, partitions)
+        cpus = 8
+        j.cpu(cpus)
+        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {cpus * 3}g --executor-memory {cpus * 3}g pyspark-shell')
+        j.call(create_final_mt, combined_tsv, final_mt_path, cpus)
 
         batch_handle = b.run()
         batch_status = batch_handle.status()
@@ -213,12 +281,25 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--rerun", action="store_true")
+    parser.add_argument('--billing-project', type=str, required=True, help='Hail Batch billing project')
+    parser.add_argument('--remote-tmpdir', type=str, required=True, help='Hail Batch remote temporary directory')
     parser.add_argument('--prefix-rows', type=int, help='number of intervals to aggregate (FOR TESTING ONLY)')
     parser.add_argument('--group-size', type=int, help='number of intervals to aggregate in one Hail Batch job')
+    parser.add_argument('--cpus', type=int, help='number of CPUs to use in aggregate jobs')
+    parser.add_argument('--memory', type=str, help='memory to use in aggregate jobs')
+    parser.add_argument('--branching-factor', type=str, help='memory to use in aggregate jobs')
 
     args = parser.parse_args()
 
-    asyncio.get_event_loop().run_until_complete(async_main(rerun=args.rerun, prefix_rows=args.prefix_rows, group_size=args.group_size))
+    asyncio.get_event_loop().run_until_complete(
+        async_main(billing_project=args.billing_project,
+                   remote_tmpdir=args.remote_tmpdir,
+                   rerun=args.rerun,
+                   prefix_rows=args.prefix_rows,
+                   group_size=args.group_size,
+                   cpus=args.cpus,
+                   memory=args.memory,
+                   branching_factor=args.branching_factor))
 
 
 main()
