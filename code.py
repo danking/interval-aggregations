@@ -14,6 +14,15 @@ from hailtop.utils import tqdm
 from hailtop.utils.utils import digits_needed
 
 
+def mb_per_cpu_per_memory(memory: str) -> float:
+    # leave a little room for other things
+    if memory == 'highmem':
+        return 6000
+    if memory == 'standard':
+        return 3250
+    return 700
+
+
 def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
     import hail as hl
 
@@ -25,7 +34,7 @@ def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
     exomes_ref_mt = exomes_ref_mt.annotate_entries(base_cnt = exomes_ref_mt.END - exomes_ref_mt.locus.position)
 
     paths = [
-        aggregate_interval_to_file(exomes_ref_mt, interval, index, uuid)
+        aggregate_interval_to_file2(exomes_ref_mt, interval, index, uuid)
         for interval in intervals]
     return paths
 
@@ -37,20 +46,35 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
 
     attempt_id = secret_alnum_string(5)
     path = f'gs://ccdg-30day-temp/dking/{uuid}/output_{index}_{attempt_id}.tsv'
-    print(f'writing {the_interval} to {path}')
+    print(f'(v2) writing {the_interval} to {path}')
     sys.stdout.flush()
     sys.stderr.flush()
     the_interval = hl.literal(the_interval)
     exomes_ref_mt = exomes_ref_mt.filter_rows(the_interval.contains(exomes_ref_mt.locus))
-    exomes_ref_mt.group_rows_by(
-        interval=the_interval
-    ).aggregate(
-        n_bases = hl.agg.sum(exomes_ref_mt.base_cnt)
-    ).key_rows_by(
-        interval=the_interval
-    ).n_bases.export(
-        path
+    ## We must avoid a shuffle which would consume unnecessary amounts of memory so we rewrite the
+    ## following to use annotate_cols, knowing that we have already filtered to the one interval of
+    ## interest.
+    #
+    # exomes_ref_mt.group_rows_by(
+    #     interval=the_interval
+    # ).aggregate(
+    #     n_bases = hl.agg.sum(exomes_ref_mt.base_cnt)
+    # ).key_rows_by(
+    #     interval=the_interval
+    # ).n_bases.export(
+    #     path
+    # )
+    exomes_ref_mt = exomes_ref_mt.annotate_cols(
+        n_bases_col = hl.agg.sum(exomes_ref_mt.base_cnt)
     )
+    exomes_ref_mt = exomes_ref_mt.head(1)
+    exomes_ref_mt = exomes_ref_mt.select_entries(
+        n_bases = exomes_ref_mt.n_bases_col
+    )
+    exomes_ref_mt = exomes_ref_mt.key_rows_by(
+        interval=the_interval
+    )
+    exomes_ref_mt.n_bases.export(path)
     return path
 
 
@@ -75,7 +99,8 @@ async def construct_aggregation_job(group, cpus, memory, uuid: str, b: hb.Batch,
         j = b.new_python_job()
         j.cpu(cpus)
         j.memory(memory)
-        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {cpus * 3}g --executor-memory {cpus * 3}g pyspark-shell')
+        memory_in_mb = cpus * mb_per_cpu_per_memory(memory)
+        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {memory_in_mb}m --executor-memory {memory_in_mb}m pyspark-shell')
         result = j.call(aggregate_by_intervals, index, cpus, intervals, uuid)
         b.write_output(result.as_json(), result_path)
 
@@ -182,7 +207,7 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
     if memory is None:
         memory = 'standard'
 
-    print(f'uuid: {uuid}; cpus: {cpus}; location: gs://ccdg-30day-temp/dking/{uuid}')
+    print(f'uuid: {uuid}; cpus: {cpus}; memory: {memory}; location: gs://ccdg-30day-temp/dking/{uuid}')
 
     with tqdm(desc='checking for extant aggregation files', leave=False, unit='file', total=len(grouped_intervals)) as file_pbar:
          b, result_paths = await construct_aggregation_batch(
@@ -266,7 +291,8 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
         j = b.new_python_job()
         cpus = 8
         j.cpu(cpus)
-        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {cpus * 3}g --executor-memory {cpus * 3}g pyspark-shell')
+        memory_in_mb = cpus * mb_per_cpu_per_memory(memory)
+        j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {memory_in_mb}m --executor-memory {memory_in_mb}m pyspark-shell')
         j.call(create_final_mt, combined_tsv, final_mt_path, cpus)
 
         batch_handle = b.run()
