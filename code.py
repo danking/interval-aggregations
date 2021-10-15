@@ -48,7 +48,6 @@ def aggregate_by_intervals(index: int,
 
     exomes_vds = hl.vds.read_vds('gs://ccdg/vds/split_200k_ccdg_exome.vds')
     exomes_ref_mt = exomes_vds.reference_data
-    exomes_ref_mt = exomes_ref_mt.annotate_entries(base_cnt = exomes_ref_mt.END - exomes_ref_mt.locus.position)
 
     paths = [
         aggregate_interval_to_file(exomes_ref_mt, interval, index, uuid)
@@ -76,7 +75,18 @@ def aggregate_interval_to_file(exomes_ref_mt: hl.MatrixTable,
     path = f'gs://ccdg-30day-temp/dking/{uuid}/output_{index}_{attempt_id}.tsv'
     print(f'writing {the_interval} to {path}', flush=True)
     the_interval = hl.literal(the_interval)
-    exomes_ref_mt = exomes_ref_mt.filter_rows(the_interval.contains(exomes_ref_mt.locus))
+    exomes_ref_mt = exomes_ref_mt.filter_rows(
+        the_interval.contains(exomes_ref_mt.locus)
+    )
+    assert the_interval.end.position > 1
+    if the_interval.includes_end:
+        interval_end_position = the_interval.end.position
+    else:
+        interval_end_position = the_interval.end.position - 1
+    end_within_interval = hl.min(interval_end_position, exomes_ref_mt.END)
+    exomes_ref_mt = exomes_ref_mt.annotate_entries(
+        base_cnt = end_within_interval - exomes_ref_mt.locus.position
+    )
     ## We must avoid a shuffle which would consume unnecessary amounts of memory so we rewrite the
     ## following to use annotate_cols, knowing that we have already filtered to the one interval of
     ## interest.
