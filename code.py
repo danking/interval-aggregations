@@ -15,7 +15,11 @@ from hailtop.utils.utils import digits_needed
 
 
 def mb_per_cpu_per_memory(memory: str) -> float:
-    # leave a little room for other things
+    """How much memory, in MB, should Hail use for each type of machine.
+
+    These numbers are slightly less than the full memory available to a 1 core job on the given
+    machine type.
+    """
     if memory == 'highmem':
         return 6000
     if memory == 'standard':
@@ -23,7 +27,20 @@ def mb_per_cpu_per_memory(memory: str) -> float:
     return 700
 
 
-def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
+def aggregate_by_intervals(index: int,
+                           cpus: int,
+                           intervals: List[hl.Interval],
+                           uuid: str) -> List[str]:
+    """Compute the interval statistics for a group of intervals.
+
+    We group many intervals into one Job in order to benefit from JVM JIT compilation as well as to
+    decrease the overhead of reading metadata from the VDS file.
+
+    We return a list of the successfully written paths. This is necessary because a Batch Job might
+    get preempted by Google. When the job is restarted, we regenerate resuts for every interval in
+    the group using new filenames just in case one of the old files was corrupted by the preemption.
+
+    """
     import hail as hl
 
     print(f'hl.init(master="local[{cpus}]")')
@@ -39,16 +56,25 @@ def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
     return paths
 
 
-def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: str) -> str:
+def aggregate_interval_to_file(exomes_ref_mt: hl.MatrixTable,
+                               the_interval: hl.Interval,
+                               index: int,
+                               uuid: str) -> str:
+    """Compute the interval statistics for `the_interval`.
+
+    Generate a unique filename and compute the statistics for `the_interval`. We play a silly game
+    with `annotate_cols`, `head`, and `select_entries` to avoid using `group_rows_by`. Aggregating
+    to column fields over all rows in the matrix table is correct because we filter the matrix table
+    to just those rows in the interval.
+
+    """
     import hail as hl
     import sys
     from hailtop.utils import secret_alnum_string
 
     attempt_id = secret_alnum_string(5)
     path = f'gs://ccdg-30day-temp/dking/{uuid}/output_{index}_{attempt_id}.tsv'
-    print(f'(v2) writing {the_interval} to {path}')
-    sys.stdout.flush()
-    sys.stderr.flush()
+    print(f'writing {the_interval} to {path}', flush=True)
     the_interval = hl.literal(the_interval)
     exomes_ref_mt = exomes_ref_mt.filter_rows(the_interval.contains(exomes_ref_mt.locus))
     ## We must avoid a shuffle which would consume unnecessary amounts of memory so we rewrite the
@@ -79,6 +105,8 @@ def aggregate_interval_to_file(exomes_ref_mt, the_interval, index: int, uuid: st
 
 
 def create_final_mt(combined_tsv: str, final_mt_path: str, cpus: int):
+    """Convert a TSV of results into a MatrixTable.
+    """
     import hail as hl
     print(f'hl.init(master="local[{cpus}]")')
     hl.init(master=f'local[{cpus}]')
@@ -86,11 +114,48 @@ def create_final_mt(combined_tsv: str, final_mt_path: str, cpus: int):
     mt = mt.annotate_rows(parsed_interval=hl.parse_locus_interval(mt.interval, reference_genome='GRCh38'))
     mt = mt.key_rows_by('parsed_interval')
     mt = mt.drop('interval')
-    mt = mt.rename({'parsed_interval': 'interval'})
+    mt = mt.rename({'parsed_interval': 'interval', 'x': 'n_bases'})
     mt.write(final_mt_path)
 
 
-async def construct_aggregation_job(group, cpus, memory, uuid: str, b: hb.Batch, fs: AsyncFS, file_pbar) -> str:
+async def construct_aggregation_batch(service_backend: hb.ServiceBackend,
+                                      grouped_intervals: List,
+                                      cpus: int,
+                                      memory: str,
+                                      uuid: str,
+                                      file_pbar) -> Tuple[hb.Batch, List[str]]:
+    """Construct a batch of calls to `aggregate_by_intervals`, one for each group in `grouped_intervals`."""
+    b = hb.Batch(
+        default_python_image='hailgenetics/hail:0.2.77',
+        backend=service_backend,
+        name=f'{uuid}: interval statistics'
+    )
+
+    async with GoogleStorageAsyncFS() as fs:
+        result_paths = await bounded_gather(
+            *[functools.partial(construct_aggregation_job, group, cpus, memory, uuid, b, fs, file_pbar)
+              for group in grouped_intervals],
+            parallelism=150)
+
+    return b, result_paths
+
+
+async def construct_aggregation_job(group,
+                                    cpus: int,
+                                    memory: str,
+                                    uuid: str,
+                                    b: hb.Batch,
+                                    fs: AsyncFS,
+                                    file_pbar) -> str:
+    """Create a job to run `aggregate_by_intervals` if its output does not already exist.
+
+    Each call to `aggregate_by_intervals` returns a list of the successful TSVs. We convert this
+    list to JSON and store it in a file in GCS. If this file already exists, then we know this job
+    has already succeeded and we can skip it.
+
+    We use `file_pbar` to indicate how many output files we've already checked for existence.
+
+    """
     index = group.group_index
     intervals = group.intervals
     result_path = f'gs://ccdg-30day-temp/dking/{uuid}/successful_paths_{index}.json'
@@ -112,22 +177,6 @@ async def construct_aggregation_job(group, cpus, memory, uuid: str, b: hb.Batch,
     return result_path
 
 
-async def construct_aggregation_batch(service_backend, grouped_intervals, cpus, memory, uuid: str, file_pbar) -> Tuple[hb.Batch, List[str]]:
-    b = hb.Batch(
-        default_python_image='hailgenetics/hail:0.2.77',
-        backend=service_backend,
-        name=f'{uuid}: interval statistics'
-    )
-
-    async with GoogleStorageAsyncFS() as fs:
-        result_paths = await bounded_gather(
-            *[functools.partial(construct_aggregation_job, group, cpus, memory, uuid, b, fs, file_pbar)
-              for group in grouped_intervals],
-            parallelism=150)
-
-    return b, result_paths
-
-
 def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None],
                    combop: Callable[[hb.job.BashJob, List[str], str], None],
                    b: hb.Batch,
@@ -136,6 +185,17 @@ def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None]
                    final_location: str,
                    branching_factor: int = 100,
                    suffix: Optional[str] = None):
+    """A hierarchical merge using Batch jobs.
+
+    We combine at most `branching_factor` paths at a time. The first layer is given by
+    `paths`. Layer n combines the files produced by layer n-1.
+
+    For the first layer, we use `base_combop` to construct a job to combine a given group. For
+    subsequent layers, we use `combop`. This permits us, for example, to start with uncompressed
+    files, but use compressed files for the intermediate steps and the final step.
+
+    The fully combined (single) file is written to `final_location`.
+    """
     assert isinstance(branching_factor, int) and branching_factor >= 1
     n_levels = math.ceil(math.log(len(paths), branching_factor))
     level_digits = digits_needed(n_levels)
@@ -145,7 +205,7 @@ def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None]
 
     def make_job_and_path(level: int,
                           i: int,
-                          make_commands: Callable[[hb.job.Job, List[str], str], None],
+                          make_commands: Callable[[hb.job.BashJob, List[str], str], None],
                           paths: List[str],
                           dependencies: List[hb.job.BashJob],
                           ofile: Optional[str] = None):
@@ -169,8 +229,10 @@ def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None]
         for i, paths in enumerate(grouped(branching_factor, paths))]
 
     for level in range(1, n_levels - 1):
+        jobs = [x[0] for x in jobs_and_paths]
+        paths = [x[1] for x in jobs_and_paths]
         jobs_and_paths = [
-            make_job_and_path(level, i, combop, [x[1] for x in jobs_and_paths], [x[0] for x in jobs_and_paths])
+            make_job_and_path(level, i, combop, paths, jobs)
             for i, jobs_and_paths in enumerate(grouped(branching_factor, jobs_and_paths))]
 
     jobs = [x[0] for x in jobs_and_paths]
@@ -178,9 +240,31 @@ def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None]
     make_job_and_path(n_levels - 1, 0, combop, paths, jobs, final_location)
 
 
-async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None, cpus: Optional[int] = None, memory: Optional[str] = None, branching_factor: Optional[int] = None):
+async def async_main(billing_project: str,
+                     remote_tmpdir: str,
+                     rerun: bool = False,
+                     prefix_rows: Optional[int] = None,
+                     group_size: Optional[int] = None,
+                     cpus: Optional[int] = None,
+                     memory: Optional[str] = None,
+                     branching_factor: Optional[int] = None):
+    """Run an interval analysis in three steps: hail-query-per-interval, combine-tsvs, convert-to-mt
 
+    This code can restart after most partial batch failures. It tracks metadata about the process in
+    a Hail Table stored at `./grouped-intervals.t`. If you want to start fresh, I recommend creating
+    a new directory and executing this file from within that directory.
+
+    """
     service_backend = hb.ServiceBackend(billing_project=billing_project, remote_tmpdir=remote_tmpdir)
+
+    if cpus is None:
+        cpus = 2
+    assert cpus >= 2  # must be at least 2, for some large intervals 4, 8, or 16 may be necessary
+
+    if memory is None:
+        memory = 'standard'
+
+    ###########################################################################
 
     if hl.hadoop_exists('grouped-intervals.t') and not rerun:
         print(' >> skipping grouped intervals creation')
@@ -209,23 +293,15 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
     grouped_intervals_table = hl.read_table('grouped-intervals.t')
     grouped_intervals = grouped_intervals_table.collect()
     uuid = grouped_intervals_table.uuid.collect()[0]
-    if prefix_rows:
-        assert prefix_rows == grouped_intervals_table.prefix_rows.collect()[0]
-    else:
-        prefix_rows = grouped_intervals_table.prefix_rows.collect()[0]
-    if group_size:
-        assert group_size == grouped_intervals_table.group_size.collect()[0]
-    else:
-        group_size = grouped_intervals_table.group_size.collect()[0]
 
-    if cpus is None:
-        cpus = 2
-    assert cpus >= 2  # must be at least 2, for some large intervals 4, 8, or 16 may be necessary
+    assert prefix_rows is None or prefix_rows == grouped_intervals_table.prefix_rows.collect()[0]
+    assert group_size is None or group_size == grouped_intervals_table.group_size.collect()[0]
 
-    if memory is None:
-        memory = 'standard'
+    ###########################################################################
 
     print(f'uuid: {uuid}; cpus: {cpus}; memory: {memory}; location: gs://ccdg-30day-temp/dking/{uuid}')
+
+    ###########################################################################
 
     with tqdm(desc='checking for extant aggregation files', leave=False, unit='file', total=len(grouped_intervals)) as file_pbar:
          b, result_paths = await construct_aggregation_batch(
@@ -244,6 +320,8 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
         if batch_status['state'] != 'success':
             print(' >> first batch failed, halting.')
             return
+
+    ###########################################################################
 
     combined_tsv = f'gs://ccdg-30day-temp/dking/{uuid}/total-final-result.tsv.bgz'
 
@@ -294,6 +372,13 @@ retry join-files
 ''')
 
         def combine_compressed_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
+            """Combine many compressed TSVs into one compressed TSV.
+
+            We use a named sink to link the subsequent reads of each file with the single output
+            file. The first file is read in its entireity. The subsequent files have their header
+            removed.
+
+            """
             j.command('set -ex -o pipefail')
             j.command('''
 function retry() {
@@ -340,6 +425,8 @@ retry join-files
         if batch_status['state'] != 'success':
             print(' >> combine batch failed, halting.')
             return
+
+    ###########################################################################
 
     final_mt_path = f'gs://ccdg-30day-temp/dking/{uuid}/total-final-result.mt'
 
