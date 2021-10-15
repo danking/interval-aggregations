@@ -80,12 +80,13 @@ def aggregate_interval_to_file(exomes_ref_mt: hl.MatrixTable,
     )
     assert the_interval.end.position > 1
     if the_interval.includes_end:
-        interval_end_position = the_interval.end.position
+        interval_inclusive_end_position = the_interval.end.position
     else:
-        interval_end_position = the_interval.end.position - 1
-    end_within_interval = hl.min(interval_end_position, exomes_ref_mt.END)
+        interval_inclusive_end_position = the_interval.end.position - 1
+    end_within_interval = hl.min(interval_inclusive_end_position, exomes_ref_mt.END)
     exomes_ref_mt = exomes_ref_mt.annotate_entries(
-        base_cnt = end_within_interval - exomes_ref_mt.locus.position
+        # we add one because both endpoints are inclusive
+        base_cnt = end_within_interval - exomes_ref_mt.locus.position + 1
     )
     ## We must avoid a shuffle which would consume unnecessary amounts of memory so we rewrite the
     ## following to use annotate_cols, knowing that we have already filtered to the one interval of
