@@ -1,4 +1,4 @@
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Callable
 import hail as hl
 import hailtop.batch as hb
 import functools
@@ -34,7 +34,7 @@ def aggregate_by_intervals(index, cpus, intervals, uuid) -> List[str]:
     exomes_ref_mt = exomes_ref_mt.annotate_entries(base_cnt = exomes_ref_mt.END - exomes_ref_mt.locus.position)
 
     paths = [
-        aggregate_interval_to_file2(exomes_ref_mt, interval, index, uuid)
+        aggregate_interval_to_file(exomes_ref_mt, interval, index, uuid)
         for interval in intervals]
     return paths
 
@@ -96,7 +96,10 @@ async def construct_aggregation_job(group, cpus, memory, uuid: str, b: hb.Batch,
     result_path = f'gs://ccdg-30day-temp/dking/{uuid}/successful_paths_{index}.json'
 
     if not await fs.exists(result_path):
-        j = b.new_python_job()
+        j = b.new_python_job(attributes={
+            'intervals': json.dumps([str(i) for i in intervals]),
+            'group_index': str(index)
+        })
         j.cpu(cpus)
         j.memory(memory)
         memory_in_mb = cpus * mb_per_cpu_per_memory(memory)
@@ -125,16 +128,31 @@ async def construct_aggregation_batch(service_backend, grouped_intervals, cpus, 
     return b, result_paths
 
 
-def batch_combine2(base_combop, combop, b, name, paths, final_location: str, branching_factor=100):
+def batch_combine2(base_combop: Callable[[hb.job.BashJob, List[str], str], None],
+                   combop: Callable[[hb.job.BashJob, List[str], str], None],
+                   b: hb.Batch,
+                   name: str,
+                   paths: List[str],
+                   final_location: str,
+                   branching_factor: int = 100,
+                   suffix: Optional[str] = None):
     assert isinstance(branching_factor, int) and branching_factor >= 1
     n_levels = math.ceil(math.log(len(paths), branching_factor))
     level_digits = digits_needed(n_levels)
     branch_digits = digits_needed((len(paths) + branching_factor) // branching_factor)
+    assert isinstance(b._backend, hb.ServiceBackend)
     tmpdir = b._backend.remote_tmpdir.rstrip('/')
 
-    def make_job_and_path(level: int, i: int, make_commands, paths: List[str], dependencies: List[hb.job.BashJob], ofile=None):
+    def make_job_and_path(level: int,
+                          i: int,
+                          make_commands: Callable[[hb.job.Job, List[str], str], None],
+                          paths: List[str],
+                          dependencies: List[hb.job.BashJob],
+                          ofile: Optional[str] = None):
         if ofile is None:
-            ofile = f'{tmpdir}/{level}/{i}'
+            ofile = f'{tmpdir}/{level:0{level_digits}}/{i:0{branch_digits}}'
+            if suffix:
+                ofile += suffix
         j = b.new_job(name=f'{name}-{level:0{level_digits}}-{i:0{branch_digits}}')
         for d in dependencies:
             j.depends_on(d)
@@ -162,7 +180,7 @@ def batch_combine2(base_combop, combop, b, name, paths, final_location: str, bra
 
 async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = False, prefix_rows: Optional[int] = None, group_size: Optional[int] = None, cpus: Optional[int] = None, memory: Optional[str] = None, branching_factor: Optional[int] = None):
 
-    service_backend = hb.ServiceBackend(billing_project=billing_project, remote_tmpdir='gs://ccdg-30day-temp/dking/tmp/')
+    service_backend = hb.ServiceBackend(billing_project=billing_project, remote_tmpdir=remote_tmpdir)
 
     if hl.hadoop_exists('grouped-intervals.t') and not rerun:
         print(' >> skipping grouped intervals creation')
@@ -216,7 +234,11 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
         print(' >> skipping aggregations')
     else:
         print(' >> running aggregations')
-        batch_handle = b.run()
+        batch_handle = b.run(wait=False)
+        try:
+            batch_handle.wait()
+        except KeyboardInterrupt:
+            batch_handle.cancel()
         batch_status = batch_handle.status()
 
         if batch_status['state'] != 'success':
@@ -249,28 +271,50 @@ async def async_main(billing_project: str, remote_tmpdir: str, rerun: bool = Fal
 
         def combine_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
             j.command('set -ex -o pipefail')
-            j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
-            bodies = [f'<(gsutil cat {x} | tail -n +2 -q || touch fail)' for x in xs]
+            j.command('''
+function retry() {
+    "$@" || { sleep 2 && "$@" ; } || { sleep 5 && "$@" ; }
+}''')
+            j.command('retry gcloud auth activate-service-account --key-file=/gsa-key/key.json')
+            serially_read_tail_of_files_to_stdout = " && ".join([
+                f'gsutil -m cat {x} | tail -n +2 -q' for x in xs[1:]])
             j.command(f'''
 join-files() {{
-    cat <(gsutil cat {xs[0]} | head -n 1 || touch fail) {" ".join(bodies)} | bgzip | gsutil cp - {ofile}
-    [ ! -e fail ]
+    rm -f sink
+    mkfifo sink
+    ( {{ gsutil -m cat {xs[0]} &&
+         {serially_read_tail_of_files_to_stdout}
+      }} | bgzip > sink
+    ) & pid=$!
+    gsutil -m cp sink {ofile}
+    wait $pid
 }}
 
-join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
+retry join-files
 ''')
 
         def combine_compressed_tsvs_with_headers(j: hb.job.BashJob, xs: List[str], ofile: str):
             j.command('set -ex -o pipefail')
-            j.command('gcloud auth activate-service-account --key-file=/gsa-key/key.json')
-            ungzipped_bodies = [f'<(gsutil cat {x} | zcat | tail -n +2 -q || touch fail)' for x in xs]
+            j.command('''
+function retry() {
+    "$@" || { sleep 2 && "$@" ; } || { sleep 5 && "$@" ; }
+}''')
+            j.command('retry gcloud auth activate-service-account --key-file=/gsa-key/key.json')
+            serially_read_tail_of_files_to_stdout = " && ".join([
+                f'gsutil -m cat {x} | bgzip -d | tail -n +2 -q' for x in xs[1:]])
             j.command(f'''
 join-files() {{
-    cat <(gsutil cat {xs[0]} | zcat | head -n 1 || touch fail) {" ".join(ungzipped_bodies)} | bgzip | gsutil cp - {ofile}
-    [ ! -e fail ]
+    rm -f sink
+    mkfifo sink
+    ( {{ gsutil -m cat {xs[0]} | bgzip -d &&
+         {serially_read_tail_of_files_to_stdout}
+      }} | bgzip > sink
+    ) & pid=$!
+    gsutil -m cp sink {ofile}
+    wait $pid
 }}
 
-join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
+retry join-files
 ''')
 
         if branching_factor is None:
@@ -283,9 +327,14 @@ join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
             'combine-tsvs-with-headers',
             mt_paths,
             final_location=combined_tsv,
-            branching_factor=branching_factor)
+            branching_factor=branching_factor,
+            suffix='.tsv.bgz')
 
-        batch_handle = b.run()
+        batch_handle = b.run(wait=False)
+        try:
+            batch_handle.wait()
+        except KeyboardInterrupt:
+            batch_handle.cancel()
         batch_status = batch_handle.status()
 
         if batch_status['state'] != 'success':
@@ -311,7 +360,11 @@ join-files || {{ sleep 2 && join-files ; }} || {{ sleep 5 && join-files ; }}
         j.env("PYSPARK_SUBMIT_ARGS", f'--driver-memory {memory_in_mb}m --executor-memory {memory_in_mb}m pyspark-shell')
         j.call(create_final_mt, combined_tsv, final_mt_path, cpus)
 
-        batch_handle = b.run()
+        batch_handle = b.run(wait=False)
+        try:
+            batch_handle.wait()
+        except KeyboardInterrupt:
+            batch_handle.cancel()
         batch_status = batch_handle.status()
 
         if batch_status['state'] != 'success':
@@ -329,7 +382,7 @@ def main():
     parser.add_argument('--group-size', type=int, help='number of intervals to aggregate in one Hail Batch job')
     parser.add_argument('--cpus', type=int, help='number of CPUs to use in aggregate jobs')
     parser.add_argument('--memory', type=str, help='memory to use in aggregate jobs')
-    parser.add_argument('--branching-factor', type=str, help='memory to use in aggregate jobs')
+    parser.add_argument('--branching-factor', type=int, help='memory to use in aggregate jobs')
 
     args = parser.parse_args()
 
